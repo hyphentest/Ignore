@@ -1,32 +1,130 @@
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
-local Knit = require(ReplicatedStorage.Packages.Knit)
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Codebase = ReplicatedStorage:WaitForChild("Codebase")
 
-local CharacterService = Knit.CreateService {
-	Name = "CharacterService",
+local Knit = require(ReplicatedStorage:WaitForChild("Packages").Knit)
+local ProfileStore = require(script:WaitForChild("ProfileStore"))
+local Notification = require(Codebase.Controllers.UIController:WaitForChild("Notification"))
+
+-- default dataslot
+local PlayerTemplate = {
+	Kills = 0,
+	Deaths = 0,
+	Cash = 0,
+	Loadout = {
+		Shirt = "",
+		Pants = "",
+		Hair = "",
+		Headgear = "",
+		Bodygear = "",
+		Armband = ""
+	}
+}
+
+local currentSession = {}
+currentSession.__index = currentSession
+
+local payInt = 300 -- 5 mins
+local payAmount = 100
+local Categories = {
+	-- TODO: use preset offsets rather than defining them
+	["Hair"] = {
+		Attachment = "HairAttachment", 
+		Target = "Head",
+		Offset = CFrame.new(0, 0, 0)
+	},
+	["Headgear"] = {
+		Attachment = "HeadgearAttachment",
+		Target = "Head", 
+		Offset = CFrame.new(0, 0, 0)
+	},
+	["Bodygear"] = {
+		Attachment = "VestAttachment", 
+		Target = "UpperTorso", 
+		Offset = CFrame.new(0, -0.2, 0)
+	},
+	["Armband"] = {
+		Attachment = "ArmbandAttachment", 
+		Target = "RightUpperArm", 
+		Offset = CFrame.new(0, -0.2, 0)
+	}
+}
+
+function currentSession.new(player, profile)
+	local self = setmetatable({}, currentSession)
+	self.Player = player
+	self.Profile = profile
+	self.Connections = {}
+	self.Character = player.Character or player.CharacterAdded:Wait()
+	return self
+end
+
+-- update a data value and sync it with the leaderstats folder
+function currentSession:UpdateStat(statName, value)
+	if self.Profile.Data[statName] ~= nil then
+		self.Profile.Data[statName] = value
+		
+		local leaderstats = self.Player:FindFirstChild("leaderstats")
+		if leaderstats then
+			local statObj = leaderstats:FindFirstChild(statName)
+			if statObj then statObj.Value = value end
+		end
+	end
+end
+
+-- basically where the saving logic is being handled
+function currentSession:SaveToLoadout(category, assetId)
+	-- save an item to the loadouts table only if the service permits it
+	if self.Profile.Data.Loadout[category] ~= nil then
+		self.Profile.Data.Loadout[category] = assetId
+	end
+end
+
+function currentSession:Destroy()
+	for _, conn in ipairs(self.Connections) do
+		if conn.Disconnect then conn:Disconnect() end
+	end
+	self.Connections = nil
+	self.Profile = nil
+end
+
+local DataService = Knit.CreateService {
+	Name = "DataService",
 	Client = {},
-	_PlayerState = {},
+	_Sessions = {},
+	_Loadout = {
+		loadoutsSave = false, 
+		--[[
+		bool for loadout saves
+		if its enabled, on leave the players currentl oadout will be saved to his session
+		allowing for his items to be back on him without needing to reequip on rejoin
+		]]
+		["Hair"] = true,
+		["Headgear"] = true,
+		["Bodygear"] = true,
+		["Armband"] = true,
+	}
 }
 
-local ATTACHMENT_MAP = {
-	["Hair"] = "HairAttachment",
-	["Headgear"] = "HeadgearAttachment",
-	["Bodygear"] = "VestAttachment",
-	["Armband"] = "ArmbandAttachment"
-}
+local function AttachModel(character, model, name, targetPartName, offsetCFrame)
+	if not model or not character then 
+		return 
+	end
 
-local function AttachModel(character, model, name, targetName, offsetCFrame)
-	if not model or not character then return end
 	local existing = character:FindFirstChild(name)
-	if existing then existing:Destroy() end
-
-	local targetPart = character:FindFirstChild(targetName)
-	if not targetPart then return end
+	local targetPart = character:FindFirstChild(targetPartName)
 
 	local clone = model:Clone()
 	local root = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart")
-	if not root then return end
-
+	if not root then
+		-- sometimes we can forget to set a primarypart
+		-- so am using this like a reminder
+		warn("model has no primarypart set on: " .. name)
+		return
+	end
+	
+	-- applying rigid const physics to the model
 	for _, part in ipairs(clone:GetDescendants()) do
 		if part:IsA("BasePart") then
 			part.Anchored = false
@@ -40,8 +138,8 @@ local function AttachModel(character, model, name, targetName, offsetCFrame)
 		end
 	end
 
-	local modelRotationOnly = clone:GetPivot().Rotation
-	clone:PivotTo(targetPart.CFrame * (offsetCFrame or CFrame.new()) * modelRotationOnly)
+	local modelRotation = clone:GetPivot().Rotation
+	clone:PivotTo(targetPart.CFrame * (offsetCFrame or CFrame.new()) * modelRotation)
 
 	local mainWeld = Instance.new("WeldConstraint")
 	mainWeld.Part0 = root
@@ -49,110 +147,162 @@ local function AttachModel(character, model, name, targetName, offsetCFrame)
 	mainWeld.Parent = root
 
 	clone.Name = name
+	--[[
+	basically the name of the attached model is always renamed to the relative category name
+	this is so whenever we destroy an attachment, it can simply choose for what the user wishes to destroy
+	in the client, whenever the player selects "None" (on the locker ui), the category is sent here to be destroyed
+	we receive categroy > check the matching category naem like: is it headgear? then destroy the HeadgearAttachment on the players character
+	]]
 	clone.Parent = character
 end
 
-local function ClearDefaultAccessories(character)
-	for _, child in ipairs(character:GetChildren()) do
-		if child:IsA("Accessory") then
-			child:Destroy()
-		end
-	end
-end
-
-function CharacterService:ForceBlocky(character)
-	local humanoid = character:WaitForChild("Humanoid")
-	if not character:IsDescendantOf(game) then
-		character.AncestryChanged:Wait()
-	end
-
-	pcall(function()
-		local description = humanoid:GetAppliedDescription()
-		description.Head = 0
-		description.LeftArm = 0
-		description.RightArm = 0
-		description.LeftLeg = 0
-		description.RightLeg = 0
-		description.Torso = 0
-		humanoid:ApplyDescription(description)
-	end)
-end
-
-function CharacterService:KnitInit()
-	self.Index = require(ReplicatedStorage.Shared:WaitForChild("Index"))
-	Players.PlayerRemoving:Connect(function(player)
-		self._PlayerState[player.UserId] = nil
-	end)
-end
-
-function CharacterService:KnitStart()
-	Players.PlayerAdded:Connect(function(player)
-		player.CharacterAppearanceLoaded:Connect(function(character)
-			self:ForceBlocky(character)
-		end)
-	end)
-end
-
-function CharacterService:EquipItem(player, category, itemData, retryCount)
-	retryCount = retryCount or 0
+function DataService:EquipItem(player, category, itemData, isAutoLoading)
+	local session = self._Sessions[player]
 	local character = player.Character
-	if not character or not character:FindFirstChild("Humanoid") then return false end
-
-	local requiredRank = itemData ~= "REMOVE" and (itemData.RankId or 0) or 0
-	if player:GetRankInGroup(self.Index.BA) < requiredRank then return false end
-
-	local success = pcall(function()
-		if itemData == "REMOVE" then
-			if category == "Shirt" then
-				local s = character:FindFirstChildOfClass("Shirt")
-				if s then s.ShirtTemplate = "" end
-			elseif category == "Pants" then
-				local p = character:FindFirstChildOfClass("Pants")
-				if p then p.PantsTemplate = "" end
-			else
-				local folderName = ATTACHMENT_MAP[category]
-				if folderName then
-					local existing = character:FindFirstChild(folderName)
-					if existing then 
-						existing:Destroy() 
-					end
-				end
-			end
-		else
-			if category == "Hair" or category == "Headgear" then
-				ClearDefaultAccessories(character)
-			end
-
-			if category == "Shirt" then
-				local shirt = character:FindFirstChildWhichIsA("Shirt") or Instance.new("Shirt", character)
-				shirt.ShirtTemplate = "rbxassetid://" .. (itemData.ShirtId or itemData.Id)
-			elseif category == "Pants" then
-				local pants = character:FindFirstChildWhichIsA("Pants") or Instance.new("Pants", character)
-				pants.PantsTemplate = "rbxassetid://" .. (itemData.PantsId or itemData.Id)
-			elseif ATTACHMENT_MAP[category] then
-				local targetPartName = (category == "Bodygear" and "UpperTorso") or (category == "Armband" and "RightUpperArm") or "Head"
-				local offset = (category == "Bodygear" or category == "Armband") and CFrame.new(0, -0.2, 0) or CFrame.new(0, 0, 0)
-				AttachModel(character, itemData.Item, ATTACHMENT_MAP[category], targetPartName, offset)
-			end
-		end
-	end)
-
-	if not success then
-		if retryCount < 3 then
-			task.wait(1)
-			return self:EquipItem(player, category, itemData, retryCount + 1)
-		end
+	if not session or not character then 
 		return false
 	end
 
-	if not self._PlayerState[player.UserId] then self._PlayerState[player.UserId] = {} end
-	self._PlayerState[player.UserId][category] = itemData
+	local assetId = (typeof(itemData) == "table") and (itemData.Id or itemData.ShirtId) or itemData
+	local success = pcall(function()
+		if category == "Shirt" then
+			local s = character:FindFirstChildOfClass("Shirt") or Instance.new("Shirt", character)
+			s.ShirtPlayerTemplate = "rbxassetid://" .. assetId
+		elseif category == "Pants" then
+			local p = character:FindFirstChildOfClass("Pants") or Instance.new("Pants", character)
+			p.PantsPlayerTemplate = "rbxassetid://" .. assetId
+		elseif Categories[category] then
+			local cfg = Categories[category]
+			if typeof(itemData) == "table" and itemData.Item then
+				AttachModel(character, itemData.Item, cfg.Attachment, cfg.Target, cfg.Offset)
+			end
+		end
+	end)
+	
+	-- check whether loadout profile saving is enabled or not
+	if success and not isAutoLoading then
+		if self._Loadout.loadoutsSave and self._Loadout[category] then
+			-- if enabled save the loadout to the players current session
+			session:SaveToLoadout(category, assetId)
+		end
+	end
 
-	return true
+	return success
 end
 
-function CharacterService.Client:RequestEquip(player, category, itemData)
-	return self.Server:EquipItem(player, category, itemData)
+function DataService:LoadSavedAppearance(player)
+	local session = self._Sessions[player]
+	if not session then return end
+
+	local savedLoadout = session.Profile.Data.Loadout
+	for category, assetId in pairs(savedLoadout) do
+		if assetId ~= "" then
+			-- true prevents constant saving during the initial load process
+			self:EquipItem(player, category, assetId, true)
+		end
+	end
 end
 
-return CharacterService
+local function GetStoreName()
+	return RunService:IsStudio() and "studio" or "Key1"
+end
+
+local PlayerStore = ProfileStore.New(GetStoreName(), PlayerTemplate)
+function DataService:OnPlayerAdded(player)
+	local profile = PlayerStore:StartSessionAsync("User_"..player.UserId, {
+		Cancel = function() return player.Parent ~= Players end,
+	})
+
+	if profile then
+		profile:AddUserId(player.UserId)
+		profile:Reconcile()
+		profile.OnSessionEnd:Connect(function()
+			self._Sessions[player] = nil
+			player:Kick("Data session closed")
+		end)
+
+		if player.Parent == Players then
+			local session = currentSession.new(player, profile)
+			self._Sessions[player] = session
+
+			local ls = Instance.new("Folder", player)
+			ls.Name = "leaderstats"
+
+			for key, val in pairs(PlayerTemplate) do
+				if typeof(val) ~= "table" then
+					local stat = Instance.new("IntValue", ls)
+					stat.Name = key
+					stat.Value = profile.Data[key]
+				end
+			end
+
+			local characterAddedConn = player.CharacterAdded:Connect(function()
+				task.wait(0.2) -- small waittime for the character to fully load
+				self:LoadSavedAppearance(player)
+			end)
+			table.insert(session.Connections, characterAddedConn)
+
+			if player.Character then 
+				task.spawn(function() self:LoadSavedAppearance(player) end) 
+			end
+		else
+			profile:EndSession()
+		end
+	else
+		-- if a data error occurs, kick the player to force rejoin
+		player:Kick("Woopsies! A data related error occured on your client! If the issue persists past numerous rejoins, open a support ticket in our communications server.")
+	end
+end
+
+function DataService:PayoutLoop()
+	task.spawn(function()
+		while true do
+			task.wait(payInt)
+			for player, session in pairs(self._Sessions) do
+				local currentCash = session.Profile.Data.Cash
+				session:UpdateStat("Cash", currentCash + payAmount)
+				-- using my own notification system here
+				Notification:SendNotification(
+					player,
+					"Royal Guard",
+					"Paycheck received!" .. payAmount .. " have been allocated to your funds account.",
+					10
+				)
+			end
+		end
+	end)
+end
+
+
+function DataService:KnitInit()
+	-- cleanup on player leave
+	Players.PlayerRemoving:Connect(function(player)
+		local session = self._Sessions[player]
+		if session then
+			session.Profile:EndSession()
+			self._Sessions[player] = nil
+		end
+	end)
+end
+
+function DataService:KnitStart()
+	for _, player in ipairs(Players:GetPlayers()) do
+		task.spawn(function() self:OnPlayerAdded(player) end)
+	end
+
+	Players.PlayerAdded:Connect(function(p) self:OnPlayerAdded(p) end)
+
+	self:PayoutLoop()
+end
+
+function DataService.Client:RequestEquip(player, category, itemData)
+	-- pass through to server method with loading flag
+	return self.Server:EquipItem(player, category, itemData, false)
+end
+
+function DataService.Client:GetPlayerStats(player)
+	local session = self.Server._Sessions[player]
+	return session and session.Profile.Data or nil
+end
+
+return DataService
