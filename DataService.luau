@@ -1,4 +1,6 @@
 --[[
+PLEASE!!!!!!!!!!!!!!!!!!!! IF YOU AREN'T WELL-VERSED IN SCRIPTING, JUST SKIP THIS APPLICATION. I'VE EXAGARRATED MY COMMENTS DUE TO THE USE OF HIGHER CODING PRACTICES
+
 i used ProfileStore for session-locking, to prevent race conditions for the players concurrent data slot and prevent accidental overwrites
 for my networking and overall architechture, i used Knit since im familiar with it, gives me a clean n promise ready bridge
 i also implemented a 'currentSession' class to encapsulate player state, letting me track RBXScriptConnections n clean them up upon disconnection
