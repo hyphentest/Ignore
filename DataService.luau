@@ -1,4 +1,8 @@
 --[[
+Connected Discord-GitHub
+bbellick
+@phoontg
+
 DataService basically handles all player data lifecycle management
 i used ProfileStore for session-locking, to prevent race conditions for the players concurrent data slot and prevent accidental overwrites
 for my networking and overall architechture, i used Knit since im familiar with it, gives me a clean n promise ready bridge
